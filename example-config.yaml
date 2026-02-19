@@ -1,0 +1,26 @@
+version: 1
+default: personal
+
+identities:
+  personal:
+    name: "John Doe"
+    email: "john@personal.com"
+    ssh_key: "~/.ssh/id_ed25519_personal"
+    hosts:
+      - github.com
+      - gitlab.com
+    paths:
+      - "~/personal"
+      - "~/oss"
+
+  work:
+    name: "John Doe"
+    email: "john@company.com"
+    ssh_key: "~/.ssh/id_ed25519_work"
+    hosts:
+      - github.com
+      - gitlab.com
+      - git.internal.company.com
+    paths:
+      - "~/company"
+      - "~/projects/client-work"
