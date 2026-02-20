@@ -766,10 +766,210 @@ apply_config() {
         log_success "identmux configuration applied successfully."
         printf '\n%sNext steps:%s\n' "${C_BOLD}" "${C_RESET}" >&2
         printf '  1. Add your public keys to your Git hosting providers.\n' >&2
-        printf '  2. For existing repos, update remotes to use host aliases:\n' >&2
-        printf '       git remote set-url origin git@github.com-<identity>:user/repo.git\n' >&2
-        printf '  3. Repos under mapped paths will auto-use the correct Git identity.\n' >&2
+        printf '  2. Repos under mapped paths will auto-use the correct Git identity.\n' >&2
         printf '\n' >&2
+
+        if (( ! NON_INTERACTIVE )) && command -v git &>/dev/null; then
+            if prompt_yesno "Update git remotes in existing repositories to use the configured SSH aliases?" "n"; then
+                update_repo_remotes
+            fi
+        fi
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Remote URL updater
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Extract the "user/repo" slug from any remote URL.
+# Handles:  git@host:user/repo.git
+#           git@host-alias:user/repo.git
+#           https://host/user/repo.git
+#           https://host/user/repo
+_extract_slug() {
+    local url="$1"
+    local slug=""
+
+    if [[ "${url}" =~ ^git@[^:]+:(.+)$ ]]; then
+        slug="${BASH_REMATCH[1]}"
+    elif [[ "${url}" =~ ^https?://[^/]+/(.+)$ ]]; then
+        slug="${BASH_REMATCH[1]}"
+    else
+        printf ''
+        return
+    fi
+
+    slug="${slug%.git}"
+    printf '%s' "${slug}"
+}
+
+# Extract the bare hostname from a remote URL, stripping any identity alias
+# suffix that identmux may have previously written (e.g. github.com-work →
+# github.com). Resolution is done against the configured host list so we never
+# read ~/.ssh/config.
+#
+# Returns empty string for unrecognised URL schemes.
+_url_bare_host() {
+    local url="$1"
+    local raw=""
+
+    if [[ "${url}" =~ ^git@([^:]+): ]]; then
+        raw="${BASH_REMATCH[1]}"
+    elif [[ "${url}" =~ ^https?://([^/]+)/ ]]; then
+        raw="${BASH_REMATCH[1]}"
+    else
+        printf ''
+        return
+    fi
+
+    # Walk every identity's host list and check whether `raw` equals a known
+    # host or is a known host with an alias suffix appended (host-label).
+    # Use a plain while-read loop to avoid any IFS side-effects.
+    local id hosts_str hostname
+    for id in ${IDENTITIES}; do
+        hosts_str="${ID_HOSTS[${id}]:-}"
+        [[ -z "${hosts_str}" ]] && continue
+        while IFS= read -r hostname; do
+            [[ -z "${hostname}" ]] && continue
+            if [[ "${raw}" == "${hostname}" || "${raw}" == "${hostname}-"* ]]; then
+                printf '%s' "${hostname}"
+                return
+            fi
+        done < <(printf '%s\n' "${hosts_str//|/$'\n'}")
+    done
+
+    # Host not managed by identmux — signal to caller to skip this remote.
+    printf ''
+}
+
+# Build the correct SSH alias URL for a given identity + bare hostname + slug.
+# Every identity (including the default) uses the explicit alias form so that
+# remotes are unambiguous and don't rely on SSH config fallthrough.
+#   git@github.com-personal:user/repo.git
+#   git@github.com-work:user/repo.git
+_target_url() {
+    local id="$1" hostname="$2" slug="$3"
+    printf 'git@%s-%s:%s.git' "${hostname}" "${id}" "${slug}"
+}
+
+# Walk every configured identity path, find git repos, collect needed remote
+# URL changes, show a summary, then apply them (or dry-run).
+update_repo_remotes() {
+    if ! command -v git &>/dev/null; then
+        die "git not found; cannot update remotes"
+    fi
+
+    # Collect changes: parallel arrays
+    local -a CHG_REPO=()
+    local -a CHG_REMOTE=()
+    local -a CHG_OLD=()
+    local -a CHG_NEW=()
+
+    local id
+    for id in ${IDENTITIES}; do
+        local paths_str="${ID_PATHS[${id}]:-}"
+        [[ -z "${paths_str}" ]] && continue
+
+        # Iterate paths for this identity (pipe-separated) without touching IFS
+        local p
+        while IFS= read -r p; do
+            [[ -z "${p}" ]] && continue
+            local base_dir
+            base_dir="$(expand_tilde "${p}")"
+            [[ -d "${base_dir}" ]] || continue
+
+            # Find all git repos under base_dir at any depth
+            local repo_dir
+            while IFS= read -r repo_dir; do
+                [[ -d "${repo_dir}" ]] || continue
+
+                # Enumerate every remote in this repo
+                local remote
+                while IFS= read -r remote; do
+                    [[ -z "${remote}" ]] && continue
+
+                    local old_url
+                    # Read the raw stored URL — bypass insteadOf rewrites which
+                    # would make already-rewritten remotes appear correct.
+                    old_url="$(git -C "${repo_dir}" config "remote.${remote}.url" 2>/dev/null)" || continue
+                    [[ -z "${old_url}" ]] && continue
+
+                    # Resolve the bare hostname from the config — no SSH config read
+                    local bare_host
+                    bare_host="$(_url_bare_host "${old_url}")"
+                    [[ -z "${bare_host}" ]] && continue  # not a managed host, skip
+
+                    # Confirm this host is actually listed for the current identity
+                    local host_listed=0
+                    local h
+                    while IFS= read -r h; do
+                        [[ "${h}" == "${bare_host}" ]] && host_listed=1 && break
+                    done < <(printf '%s\n' "${ID_HOSTS[${id}]:-}" | tr '|' '\n')
+                    (( host_listed )) || continue
+
+                    local slug
+                    slug="$(_extract_slug "${old_url}")"
+                    [[ -z "${slug}" ]] && continue
+
+                    local new_url
+                    new_url="$(_target_url "${id}" "${bare_host}" "${slug}")"
+
+                    # Only record if a change is actually needed
+                    if [[ "${old_url}" != "${new_url}" ]]; then
+                        CHG_REPO+=("${repo_dir%/}")
+                        CHG_REMOTE+=("${remote}")
+                        CHG_OLD+=("${old_url}")
+                        CHG_NEW+=("${new_url}")
+                    fi
+                done < <(git -C "${repo_dir}" remote 2>/dev/null)
+            done < <(find "${base_dir}" -mindepth 1 -name ".git" -type d 2>/dev/null | sed 's|/.git$||' | sort)
+        done < <(printf '%s\n' "${paths_str//|/$'\n'}")
+    done
+
+    if (( ${#CHG_REPO[@]} == 0 )); then
+        log_info "All remote URLs are already up to date. Nothing to change."
+        return 0
+    fi
+
+    # Print summary table
+    printf '\n%s╔══════════════════════════════════════╗%s\n' "${C_BOLD}" "${C_RESET}" >&2
+    printf '%s║       remote URL updates             ║%s\n' "${C_BOLD}" "${C_RESET}" >&2
+    printf '%s╚══════════════════════════════════════╝%s\n\n' "${C_BOLD}" "${C_RESET}" >&2
+
+    local i
+    for i in "${!CHG_REPO[@]}"; do
+        printf '%s● %s%s  (%s)\n' "${C_CYAN}" "$(basename "${CHG_REPO[$i]}")" "${C_RESET}" "${CHG_REMOTE[$i]}" >&2
+        printf '  %sold:%s %s\n' "${C_DIM}" "${C_RESET}" "${CHG_OLD[$i]}" >&2
+        printf '  %snew:%s %s\n' "${C_GREEN}" "${C_RESET}" "${CHG_NEW[$i]}" >&2
+        printf '\n' >&2
+    done
+
+    if (( DRY_RUN )); then
+        log_info "[dry-run] Would update ${#CHG_REPO[@]} remote(s). No changes made."
+        return 0
+    fi
+
+    if (( ! NON_INTERACTIVE )); then
+        if ! prompt_yesno "Apply these ${#CHG_REPO[@]} remote update(s)?"; then
+            log_info "Skipped remote updates."
+            return 0
+        fi
+    fi
+
+    local failed=0
+    for i in "${!CHG_REPO[@]}"; do
+        if git -C "${CHG_REPO[$i]}" remote set-url "${CHG_REMOTE[$i]}" "${CHG_NEW[$i]}" 2>/dev/null; then
+            log_success "Updated ${CHG_REMOTE[$i]} in $(basename "${CHG_REPO[$i]}"): ${CHG_NEW[$i]}"
+        else
+            log_error "Failed to update ${CHG_REMOTE[$i]} in ${CHG_REPO[$i]}"
+            (( failed++ )) || true
+        fi
+    done
+
+    if (( failed > 0 )); then
+        log_warn "${failed} remote(s) could not be updated."
+    else
+        log_success "All remote URLs updated successfully."
     fi
 }
 
@@ -931,7 +1131,8 @@ handle_existing_config() {
         "Reapply existing configuration" \
         "Overwrite with new configuration" \
         "Edit interactively (re-run wizard)" \
-        "Show current configuration")"
+        "Show current configuration" \
+        "Update git remotes in existing repositories")"
 
     case "${choice}" in
         1)
@@ -948,6 +1149,10 @@ handle_existing_config() {
             config_load
             print_summary
             ;;
+        5)
+            config_load
+            update_repo_remotes
+            ;;
     esac
 }
 
@@ -960,20 +1165,22 @@ usage() {
 ${C_BOLD}identmux${C_RESET} v${IDENTMUX_VERSION} — identity multiplexer for development environments
 
 ${C_BOLD}USAGE${C_RESET}
-    curl -fsSL <url>/identmux.sh | bash                       Interactive setup
-    curl -fsSL <url>/identmux.sh | bash -s -- --apply         Reapply config
-    curl -fsSL <url>/identmux.sh | bash -s -- --config <url>  Load remote config
-    curl -fsSL <url>/identmux.sh | bash -s -- --export        Print config
-    curl -fsSL <url>/identmux.sh | bash -s -- --dry-run       Preview changes
-    ./identmux.sh [options]                                   Run directly
+    curl -fsSL <url>/identmux.sh | bash                              Interactive setup
+    curl -fsSL <url>/identmux.sh | bash -s -- --apply               Reapply config
+    curl -fsSL <url>/identmux.sh | bash -s -- --config <url>        Load remote config
+    curl -fsSL <url>/identmux.sh | bash -s -- --export              Print config
+    curl -fsSL <url>/identmux.sh | bash -s -- --update-remotes      Update existing repo remotes
+    curl -fsSL <url>/identmux.sh | bash -s -- --dry-run             Preview changes
+    ./identmux.sh [options]                                          Run directly
 
 ${C_BOLD}OPTIONS${C_RESET}
-    --apply          Reapply existing configuration non-interactively
-    --config <url>   Fetch config from URL and apply
-    --export         Print current config.yaml to stdout
-    --dry-run        Show what would be changed without modifying files
-    --help           Show this help message
-    --version        Print version
+    --apply             Reapply existing configuration non-interactively
+    --config <url>      Fetch config from URL and apply
+    --export            Print current config.yaml to stdout
+    --update-remotes    Update git remote URLs in existing repos to match SSH aliases
+    --dry-run           Show what would be changed without modifying files
+    --help              Show this help message
+    --version           Print version
 
 ${C_BOLD}CONFIG${C_RESET}
     ${CONFIG_FILE}
@@ -1012,7 +1219,7 @@ preflight() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 main() {
-    local mode="auto"       # auto | apply | config | export | help | version
+    local mode="auto"       # auto | apply | config | export | update-remotes | help | version
     local config_url=""
 
     # Parse arguments
@@ -1020,6 +1227,11 @@ main() {
         case "$1" in
             --apply)
                 mode="apply"
+                NON_INTERACTIVE=1
+                shift
+                ;;
+            --update-remotes)
+                mode="update-remotes"
                 NON_INTERACTIVE=1
                 shift
                 ;;
@@ -1080,6 +1292,15 @@ main() {
             fi
             config_load
             apply_config
+            exit 0
+            ;;
+        update-remotes)
+            preflight
+            if ! config_exists; then
+                die "No config found at ${CONFIG_FILE}. Run identmux interactively first."
+            fi
+            config_load
+            update_repo_remotes
             exit 0
             ;;
         auto)

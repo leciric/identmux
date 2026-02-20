@@ -21,6 +21,9 @@ curl -fsSL https://raw.githubusercontent.com/leciric/identmux/main/identmux.sh |
 
 # Export current config
 curl -fsSL https://raw.githubusercontent.com/leciric/identmux/main/identmux.sh | bash -s -- --export
+
+# Update git remote URLs in existing repos
+curl -fsSL https://raw.githubusercontent.com/leciric/identmux/main/identmux.sh | bash -s -- --update-remotes
 ```
 
 Or run directly:
@@ -28,6 +31,7 @@ Or run directly:
 ```bash
 ./identmux.sh
 ./identmux.sh --apply
+./identmux.sh --update-remotes
 ./identmux.sh --dry-run
 ```
 
@@ -52,6 +56,7 @@ When applied, identmux:
 2. **Writes SSH host aliases** to `~/.ssh/config` so different keys route to the same host
 3. **Configures Git `includeIf`** directives in `~/.gitconfig` so repos under mapped paths automatically use the correct name and email
 4. **Writes URL rewrite rules** into each per-identity gitconfig so that `git clone git@github.com:org/repo` or `git clone https://github.com/org/repo` automatically routes to the correct SSH alias when run inside a mapped directory — no manual remote editing required
+5. **Optionally updates existing repo remotes** to point to the correct SSH alias for their directory's identity
 
 All managed sections are delimited with markers and are fully idempotent — rerunning overwrites only the managed blocks.
 
@@ -165,9 +170,34 @@ Any repo under `~/company/` will automatically use the work identity's name, ema
 | `--apply` | Reapply existing config non-interactively |
 | `--config <url>` | Fetch config from URL and apply |
 | `--export` | Print config to stdout |
+| `--update-remotes` | Update git remote URLs in existing repos to match SSH aliases |
 | `--dry-run` | Preview all changes without writing |
 | `--help` | Show usage |
 | `--version` | Print version |
+
+### Interactive menu
+
+When a config already exists and you run `./identmux.sh` without flags, you are presented with a menu:
+
+1. Reapply existing configuration
+2. Overwrite with new configuration
+3. Edit interactively (re-run wizard)
+4. Show current configuration
+5. Update git remotes in existing repositories
+
+### Updating existing repo remotes
+
+When you run `--update-remotes` (or choose option 5 from the menu, or answer yes to the prompt shown after a fresh `--apply`), identmux:
+
+- Walks every directory configured under each identity's `paths`
+- Finds all git repositories (direct subdirectories with a `.git/` folder)
+- Checks every remote in each repo for URLs matching a configured host
+- Computes the correct SSH URL for the repo's identity:
+  - Default identity → `git@github.com:user/repo.git`
+  - Other identities → `git@github.com-work:user/repo.git`
+- Shows a summary of all proposed changes and asks for a single confirmation before applying
+
+Handles both SSH (`git@host:`) and HTTPS (`https://host/`) source URLs, and normalizes them all to SSH. Supports `--dry-run` to preview without making changes.
 
 ## Requirements
 
